@@ -7,12 +7,9 @@
 -- Database: PostgreSQL 16
 -- =====================================================================
 
--- Existing triggers are retained:
---   trg_claim_status_audit
---   trg_claim_approval_reports
---   trg_validate_handover_date
---
--- Do not create duplicate audit or report-update triggers here.
+-- Triggers and workflow functions are defined in db/triggers.sql.
+-- Apply db/triggers.sql before using approve_claim().
+-- Physical handover is recorded separately using record_handover().
 
 
 -- =====================================================================
@@ -50,15 +47,13 @@ BEGIN
     RETURN NEW;
 END;
 $$;
-
-
 -- =====================================================================
--- 2. APPROVE CLAIM AND CREATE HANDOVER RECORD
+-- 2. APPROVE CLAIM
 -- =====================================================================
 
--- Preserve the existing TEXT return type.
--- Claim approval, report updates, audit logging and handover insertion
--- run in the same transaction.
+-- Approval updates the claim and report statuses.
+-- Physical handover is recorded separately using record_handover()
+-- in db/triggers.sql.
 
 CREATE OR REPLACE FUNCTION approve_claim(
     p_claim_id INT,
@@ -82,14 +77,12 @@ BEGIN
             'Claim % does not exist', p_claim_id;
     END IF;
 
-    -- Only pending claims may be approved.
     IF v_claim.status <> 'pending' THEN
         RAISE EXCEPTION
             'Claim % is not pending (current status: %)',
             p_claim_id, v_claim.status;
     END IF;
 
-    -- Only active staff or administrators may approve.
     IF NOT EXISTS (
         SELECT 1
         FROM staff
@@ -102,27 +95,24 @@ BEGIN
             p_staff_id;
     END IF;
 
-    -- Both reports must still be open.
     IF NOT EXISTS (
         SELECT 1
         FROM lost_report
         WHERE lost_report_id = v_claim.lost_report_id
-          AND status = 'open'
+          AND status IN ('open', 'matched')
     ) THEN
-        RAISE EXCEPTION 'Lost report is not open';
+        RAISE EXCEPTION 'Lost report is not open or matched';
     END IF;
 
     IF NOT EXISTS (
         SELECT 1
         FROM found_report
         WHERE found_report_id = v_claim.found_report_id
-          AND status = 'open'
+          AND status IN ('open', 'matched')
     ) THEN
-        RAISE EXCEPTION 'Found report is not open';
+        RAISE EXCEPTION 'Found report is not open or matched';
     END IF;
 
-    -- Update the claim.
-    -- Existing triggers log the change and update both reports.
     UPDATE claim
     SET status = 'approved',
         verified_by = p_staff_id,
@@ -136,25 +126,9 @@ BEGIN
             || 'Approved by staff ID ' || p_staff_id
     WHERE claim_id = p_claim_id;
 
-    -- Record the handover in the database.
-    -- This record does not by itself prove physical delivery.
-    INSERT INTO handover (
-        claim_id,
-        staff_id,
-        verification_method,
-        remarks
-    )
-    VALUES (
-        p_claim_id,
-        p_staff_id,
-        'resident_id',
-        'Handover record created; physical handover must be completed'
-    );
-
-    RETURN 'Claim approved; handover record created';
+    RETURN 'Claim approved; handover must be recorded separately';
 END;
 $$;
-
 
 -- =====================================================================
 -- 3. ADMIN VIEW: PENDING CLAIMS
