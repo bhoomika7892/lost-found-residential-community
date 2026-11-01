@@ -3,8 +3,16 @@ export const runtime = "nodejs";
 import { processNewItem } from "@/lib/process-new-item";
 import { NextResponse } from "next/server";
 import { pool } from "@/lib/db";
-
+import { auth } from "@/auth";
 export async function GET() {
+  const session = await auth();
+
+  if (!session?.user) {
+    return NextResponse.json(
+      { success: false, message: "Unauthorized" },
+      { status: 401 }
+    );
+  }
   try {
     const result = await pool.query(`
       SELECT
@@ -43,6 +51,20 @@ export async function GET() {
   }
 }
 export async function POST(request: Request) {
+  const session = await auth();
+
+  if (
+    !session?.user ||
+    session.user.role !== "resident" ||
+    !session.user.residentId
+  ) {
+    return NextResponse.json(
+      { success: false, message: "Unauthorized" },
+      { status: 401 }
+    );
+  }
+
+  const residentId = session.user.residentId;
   let client;
 
   try {
@@ -54,7 +76,6 @@ export async function POST(request: Request) {
       color,
       brand,
       description,
-      resident_id,
       location_id,
       lost_date,
     } = body;
@@ -63,7 +84,6 @@ export async function POST(request: Request) {
       typeof item_name !== "string" ||
       !item_name.trim() ||
       !category_id ||
-      !resident_id ||
       !location_id ||
       !lost_date
     ) {
@@ -81,12 +101,10 @@ export async function POST(request: Request) {
     }
 
     const categoryId = Number(category_id);
-    const residentId = Number(resident_id);
     const locationId = Number(location_id);
 
     if (
       !Number.isInteger(categoryId) ||
-      !Number.isInteger(residentId) ||
       !Number.isInteger(locationId)
     ) {
       return NextResponse.json(

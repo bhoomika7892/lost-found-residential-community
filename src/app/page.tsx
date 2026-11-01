@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-
+import { signOut } from "next-auth/react";
 type ItemReport = {
   lost_report_id?: number;
   found_report_id?: number;
@@ -171,10 +171,6 @@ export default function Home() {
       brand: formData.brand.trim() || null,
       description: formData.description.trim() || null,
       location_id: Number(formData.location_id),
-
-      // Temporary development IDs until resident login/session mapping is added.
-      resident_id: activeForm === "lost" ? 1 : 2,
-
       [activeForm === "lost" ? "lost_date" : "found_date"]:
         formData.report_date,
     };
@@ -224,14 +220,24 @@ export default function Home() {
   return (
     <main className="min-h-screen bg-slate-50 text-slate-900">
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto max-w-6xl px-6 py-6">
-          <p className="text-sm font-semibold uppercase tracking-wider text-teal-700">
-            Residential Community
-          </p>
-          <h1 className="mt-1 text-3xl font-bold">Lost & Found</h1>
-          <p className="mt-2 text-slate-600">
-            Helping residents reconnect with their belongings.
-          </p>
+        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-6">
+          <div>
+            <p className="text-sm font-semibold uppercase tracking-wider text-teal-700">
+              Residential Community
+            </p>
+            <h1 className="mt-1 text-3xl font-bold">Lost & Found</h1>
+            <p className="mt-2 text-slate-600">
+              Helping residents reconnect with their belongings.
+            </p>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => signOut({ callbackUrl: "/login" })}
+            className="shrink-0 rounded-lg border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-100"
+          >
+            Logout
+          </button>
         </div>
       </header>
 
