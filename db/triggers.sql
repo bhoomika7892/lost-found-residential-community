@@ -1,37 +1,54 @@
+
 -- =====================================================================
--- Lost & Found Residential Community
--- File: db/triggers.sql
--- Adds audit/report/handover triggers and corrected workflow functions.
--- Run AFTER schema_reporting.sql and schema_claims.sql.
+-- CLAIMS WORKFLOW: TRIGGER FUNCTIONS AND DECLARATIONS
+-- PostgreSQL 16
+--
+-- Requires:
+--   1. schema_reporting.sql
+--   2. schema_claims.sql
+--   3. claims_security.sql
+--
+-- Business functions and pending claims view:
+--   advanced_claims.sql
+--
+-- IMPORTANT:
+-- Run only against the disposable claims test database.
+-- Do not run schema_reporting.sql against an existing database.
 -- =====================================================================
 
 
--- ---------------------------------------------------------------------
+-- =====================================================================
 -- 1. AUDIT STATUS CHANGES
--- Supports claim, lost_report, and found_report.
--- ---------------------------------------------------------------------
+-- =====================================================================
 
 CREATE OR REPLACE FUNCTION audit_status_change()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
 AS $$
 DECLARE
     v_record_id INT;
 BEGIN
     IF OLD.status IS DISTINCT FROM NEW.status THEN
 
-        IF TG_TABLE_NAME = 'claim' THEN
-            v_record_id := NEW.claim_id;
-        ELSIF TG_TABLE_NAME = 'lost_report' THEN
-            v_record_id := NEW.lost_report_id;
-        ELSIF TG_TABLE_NAME = 'found_report' THEN
-            v_record_id := NEW.found_report_id;
-        ELSE
-            RAISE EXCEPTION 'Unsupported table for status audit: %',
-                TG_TABLE_NAME;
-        END IF;
+        CASE TG_TABLE_NAME
+            WHEN 'claim' THEN
+                v_record_id := NEW.claim_id;
 
-        INSERT INTO audit_log (
+            WHEN 'lost_report' THEN
+                v_record_id := NEW.lost_report_id;
+
+            WHEN 'found_report' THEN
+                v_record_id := NEW.found_report_id;
+
+            ELSE
+                RAISE EXCEPTION
+                    'Unsupported table for status audit: %',
+                    TG_TABLE_NAME;
+        END CASE;
+
+        INSERT INTO public.audit_log (
             table_name,
             record_id,
             old_status,
@@ -43,6 +60,7 @@ BEGIN
             OLD.status,
             NEW.status
         );
+
     END IF;
 
     RETURN NEW;
@@ -50,40 +68,183 @@ END;
 $$;
 
 
--- ---------------------------------------------------------------------
--- 2. WHEN A CLAIM IS APPROVED, MARK BOTH REPORTS AS CLAIMED
--- Approval does NOT create a handover record.
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 2. CLAIM WRITE GUARD
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION guard_claim_write()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
+AS $$
+DECLARE
+    v_actor_id INT;
+BEGIN
+
+    -- New claims must always start as pending.
+    IF TG_OP = 'INSERT' THEN
+
+        IF NEW.status <> 'pending'
+           OR NEW.verified_by IS NOT NULL THEN
+
+            RAISE EXCEPTION
+                'Claims must be created pending without a reviewer';
+
+        END IF;
+
+        -- Claimant must own the lost report.
+        IF NOT EXISTS (
+            SELECT 1
+            FROM public.lost_report
+            WHERE lost_report_id = NEW.lost_report_id
+              AND resident_id = NEW.claimant_id
+        ) THEN
+
+            RAISE EXCEPTION
+                'Claimant must own the lost report';
+
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+
+    -- Update timestamp.
+    NEW.updated_at := CURRENT_TIMESTAMP;
+
+
+    -- A status change must be a valid authenticated decision.
+    IF OLD.status IS DISTINCT FROM NEW.status THEN
+
+        IF OLD.status <> 'pending'
+           OR NEW.status NOT IN ('approved', 'rejected') THEN
+
+            RAISE EXCEPTION
+                'Invalid claim status transition: % -> %',
+                OLD.status,
+                NEW.status;
+
+        END IF;
+
+
+        IF NEW.status = 'approved' THEN
+
+            v_actor_id := claims_private.require_action(
+                'claim:approve'
+            );
+
+        ELSE
+
+            v_actor_id := claims_private.require_action(
+                'claim:reject'
+            );
+
+            IF NEW.verification_notes IS NULL
+               OR btrim(NEW.verification_notes) = '' THEN
+
+                RAISE EXCEPTION
+                    'Rejection notes are required';
+
+            END IF;
+
+        END IF;
+
+
+        -- Reviewer must match the authenticated staff member.
+        IF NEW.verified_by IS DISTINCT FROM v_actor_id THEN
+
+            RAISE EXCEPTION
+                'Decision reviewer does not match authenticated actor';
+
+        END IF;
+
+
+    -- Protect decision and identity fields from independent updates.
+    ELSIF NEW.verified_by IS DISTINCT FROM OLD.verified_by
+       OR NEW.verification_notes IS DISTINCT FROM OLD.verification_notes
+       OR NEW.lost_report_id IS DISTINCT FROM OLD.lost_report_id
+       OR NEW.found_report_id IS DISTINCT FROM OLD.found_report_id
+       OR NEW.claimant_id IS DISTINCT FROM OLD.claimant_id
+       OR NEW.claim_date IS DISTINCT FROM OLD.claim_date THEN
+
+        RAISE EXCEPTION
+            'Decision and claim identity fields can only change during a valid claim decision';
+
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+-- =====================================================================
+-- 3. UPDATE REPORTS AFTER CLAIM APPROVAL
+-- =====================================================================
 
 CREATE OR REPLACE FUNCTION update_reports_after_claim_approval()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
 AS $$
+DECLARE
+    v_lost_status VARCHAR(10);
+    v_found_status VARCHAR(10);
 BEGIN
+
     IF OLD.status IS DISTINCT FROM NEW.status
        AND NEW.status = 'approved' THEN
 
-        UPDATE lost_report
-        SET status = 'claimed'
-        WHERE lost_report_id = NEW.lost_report_id
-          AND status IN ('open', 'matched');
+        PERFORM claims_private.require_action(
+            'claim:approve'
+        );
 
-        IF NOT FOUND THEN
+
+        -- Lock and check the lost report.
+        SELECT status
+        INTO v_lost_status
+        FROM public.lost_report
+        WHERE lost_report_id = NEW.lost_report_id
+        FOR UPDATE;
+
+
+        -- Lock and check the found report.
+        SELECT status
+        INTO v_found_status
+        FROM public.found_report
+        WHERE found_report_id = NEW.found_report_id
+        FOR UPDATE;
+
+
+        IF v_lost_status NOT IN ('open', 'matched') THEN
+
             RAISE EXCEPTION
                 'Lost report % is not open or matched',
                 NEW.lost_report_id;
+
         END IF;
 
-        UPDATE found_report
-        SET status = 'claimed'
-        WHERE found_report_id = NEW.found_report_id
-          AND status IN ('open', 'matched');
 
-        IF NOT FOUND THEN
+        IF v_found_status NOT IN ('open', 'matched') THEN
+
             RAISE EXCEPTION
                 'Found report % is not open or matched',
                 NEW.found_report_id;
+
         END IF;
+
+
+        -- Both reports become claimed.
+        UPDATE public.lost_report
+        SET status = 'claimed'
+        WHERE lost_report_id = NEW.lost_report_id;
+
+
+        UPDATE public.found_report
+        SET status = 'claimed'
+        WHERE found_report_id = NEW.found_report_id;
+
     END IF;
 
     RETURN NEW;
@@ -91,46 +252,210 @@ END;
 $$;
 
 
--- ---------------------------------------------------------------------
--- 3. VALIDATE HANDOVER INSERTS
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 4. REPORT STATUS GUARD
+-- =====================================================================
 
-CREATE OR REPLACE FUNCTION validate_handover_date()
+CREATE OR REPLACE FUNCTION guard_report_status()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
 AS $$
 DECLARE
-    v_claim_date TIMESTAMP;
-    v_claim_status VARCHAR(10);
+    v_claim_id INT;
 BEGIN
-    SELECT claim_date, status
-    INTO v_claim_date, v_claim_status
-    FROM claim
-    WHERE claim_id = NEW.claim_id;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Claim % does not exist', NEW.claim_id;
+    -- No status change: allow the update.
+    IF OLD.status IS NOT DISTINCT FROM NEW.status THEN
+        RETURN NEW;
     END IF;
 
-    IF v_claim_status <> 'approved' THEN
+
+    -- Matching may change reports only between open and matched.
+    -- Matching cannot claim or close reports.
+    IF OLD.status IN ('open', 'matched')
+       AND NEW.status IN ('open', 'matched') THEN
+
+        RETURN NEW;
+
+    END IF;
+
+
+    -- A report can become claimed only during claim approval.
+    IF NEW.status = 'claimed'
+       AND OLD.status IN ('open', 'matched') THEN
+
+        PERFORM claims_private.require_action(
+            'claim:approve'
+        );
+
+
+        IF TG_TABLE_NAME = 'lost_report' THEN
+
+            SELECT claim_id
+            INTO v_claim_id
+            FROM public.claim
+            WHERE lost_report_id = NEW.lost_report_id
+              AND status = 'approved';
+
+        ELSE
+
+            SELECT claim_id
+            INTO v_claim_id
+            FROM public.claim
+            WHERE found_report_id = NEW.found_report_id
+              AND status = 'approved';
+
+        END IF;
+
+
+        IF v_claim_id IS NULL THEN
+
+            RAISE EXCEPTION
+                'A report can be claimed only by an approved claim';
+
+        END IF;
+
+        RETURN NEW;
+
+    END IF;
+
+
+    -- A report can become closed only after a recorded handover.
+    IF NEW.status = 'closed'
+       AND OLD.status = 'claimed' THEN
+
+        PERFORM claims_private.require_action(
+            'handover:record'
+        );
+
+
+        IF TG_TABLE_NAME = 'lost_report' THEN
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM public.claim c
+                JOIN public.handover h USING (claim_id)
+                WHERE c.lost_report_id = NEW.lost_report_id
+                  AND c.status = 'approved'
+            ) THEN
+
+                RAISE EXCEPTION
+                    'A report can be closed only after handover';
+
+            END IF;
+
+        ELSE
+
+            IF NOT EXISTS (
+                SELECT 1
+                FROM public.claim c
+                JOIN public.handover h USING (claim_id)
+                WHERE c.found_report_id = NEW.found_report_id
+                  AND c.status = 'approved'
+            ) THEN
+
+                RAISE EXCEPTION
+                    'A report can be closed only after handover';
+
+            END IF;
+
+        END IF;
+
+        RETURN NEW;
+
+    END IF;
+
+
+    -- Reject every other status transition.
+    RAISE EXCEPTION
+        'Invalid report status transition: % -> %',
+        OLD.status,
+        NEW.status;
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 5. HANDOVER INSERT GUARD
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION guard_handover_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
+AS $$
+DECLARE
+    v_claim public.claim%ROWTYPE;
+    v_actor_id INT;
+    v_lost_status VARCHAR(10);
+    v_found_status VARCHAR(10);
+BEGIN
+
+    v_actor_id := claims_private.require_action(
+        'handover:record'
+    );
+
+
+    -- Handover staff must match the authenticated actor.
+    IF NEW.staff_id IS DISTINCT FROM v_actor_id THEN
+
         RAISE EXCEPTION
-            'Handover can only be recorded for an approved claim';
+            'Handover staff does not match authenticated actor';
+
     END IF;
 
-    IF NEW.handover_date < v_claim_date THEN
+
+    -- Lock and retrieve the claim.
+    SELECT *
+    INTO v_claim
+    FROM public.claim
+    WHERE claim_id = NEW.claim_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND OR v_claim.status <> 'approved' THEN
+
+        RAISE EXCEPTION
+            'Handover requires an approved claim';
+
+    END IF;
+
+
+    -- Handover date cannot precede the claim date.
+    IF NEW.handover_date IS NULL
+       OR NEW.handover_date < v_claim.claim_date THEN
+
         RAISE EXCEPTION
             'Handover date cannot be earlier than claim date';
+
     END IF;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM staff
-        WHERE staff_id = NEW.staff_id
-          AND active = TRUE
-          AND role IN ('staff', 'admin')
-    ) THEN
+
+    -- Lock reports in a consistent order.
+    SELECT status
+    INTO v_lost_status
+    FROM public.lost_report
+    WHERE lost_report_id = v_claim.lost_report_id
+    FOR UPDATE;
+
+
+    SELECT status
+    INTO v_found_status
+    FROM public.found_report
+    WHERE found_report_id = v_claim.found_report_id
+    FOR UPDATE;
+
+
+    IF v_lost_status <> 'claimed'
+       OR v_found_status <> 'claimed' THEN
+
         RAISE EXCEPTION
-            'Invalid or inactive staff account: %', NEW.staff_id;
+            'Both reports must be claimed before handover';
+
     END IF;
 
     RETURN NEW;
@@ -138,242 +463,267 @@ END;
 $$;
 
 
--- ---------------------------------------------------------------------
--- 4. AFTER HANDOVER, CLOSE BOTH REPORTS
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 6. PREVENT HANDOVER MODIFICATION OR DELETION
+-- =====================================================================
+
+CREATE OR REPLACE FUNCTION reject_handover_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
+AS $$
+BEGIN
+
+    RAISE EXCEPTION
+        'Handover records are immutable';
+
+END;
+$$;
+
+
+-- =====================================================================
+-- 7. CLOSE REPORTS AFTER HANDOVER
+-- =====================================================================
 
 CREATE OR REPLACE FUNCTION close_reports_after_handover()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, claims_private, pg_temp
 AS $$
 DECLARE
-    v_lost_report_id INT;
-    v_found_report_id INT;
+    v_claim public.claim%ROWTYPE;
 BEGIN
-    SELECT lost_report_id, found_report_id
-    INTO v_lost_report_id, v_found_report_id
-    FROM claim
-    WHERE claim_id = NEW.claim_id;
 
-    UPDATE lost_report
+    PERFORM claims_private.require_action(
+        'handover:record'
+    );
+
+
+    SELECT *
+    INTO v_claim
+    FROM public.claim
+    WHERE claim_id = NEW.claim_id
+    FOR UPDATE;
+
+
+    IF NOT FOUND OR v_claim.status <> 'approved' THEN
+
+        RAISE EXCEPTION
+            'Handover requires an approved claim';
+
+    END IF;
+
+
+    -- Stable lock order: lost report first, then found report.
+    PERFORM 1
+    FROM public.lost_report
+    WHERE lost_report_id = v_claim.lost_report_id
+    FOR UPDATE;
+
+
+    PERFORM 1
+    FROM public.found_report
+    WHERE found_report_id = v_claim.found_report_id
+    FOR UPDATE;
+
+
+    -- Close the lost report.
+    UPDATE public.lost_report
     SET status = 'closed'
-    WHERE lost_report_id = v_lost_report_id
+    WHERE lost_report_id = v_claim.lost_report_id
       AND status = 'claimed';
 
-    UPDATE found_report
+
+    IF NOT FOUND THEN
+
+        RAISE EXCEPTION
+            'Lost report is not claimed';
+
+    END IF;
+
+
+    -- Close the found report.
+    UPDATE public.found_report
     SET status = 'closed'
-    WHERE found_report_id = v_found_report_id
+    WHERE found_report_id = v_claim.found_report_id
       AND status = 'claimed';
+
+
+    IF NOT FOUND THEN
+
+        RAISE EXCEPTION
+            'Found report is not claimed';
+
+    END IF;
 
     RETURN NEW;
 END;
 $$;
 
 
--- ---------------------------------------------------------------------
--- 5. CORRECTED APPROVE CLAIM FUNCTION
--- Approval and physical handover are separate operations.
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 8. REMOVE KNOWN LEGACY TRIGGERS BEFORE RECREATING THEM
+-- =====================================================================
 
-CREATE OR REPLACE FUNCTION approve_claim(
-    p_claim_id INT,
-    p_staff_id INT
-)
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_claim claim%ROWTYPE;
-BEGIN
-    SELECT *
-    INTO v_claim
-    FROM claim
-    WHERE claim_id = p_claim_id
-    FOR UPDATE;
+DROP TRIGGER IF EXISTS trg_claim_status_audit
+ON public.claim;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Claim % does not exist', p_claim_id;
-    END IF;
+DROP TRIGGER IF EXISTS trg_lost_report_status_audit
+ON public.lost_report;
 
-    IF v_claim.status <> 'pending' THEN
-        RAISE EXCEPTION
-            'Claim % is not pending (current status: %)',
-            p_claim_id, v_claim.status;
-    END IF;
+DROP TRIGGER IF EXISTS trg_found_report_status_audit
+ON public.found_report;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM staff
-        WHERE staff_id = p_staff_id
-          AND active = TRUE
-          AND role IN ('staff', 'admin')
-    ) THEN
-        RAISE EXCEPTION
-            'Invalid or inactive staff account: %', p_staff_id;
-    END IF;
+DROP TRIGGER IF EXISTS trg_claim_approval_reports
+ON public.claim;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM lost_report
-        WHERE lost_report_id = v_claim.lost_report_id
-          AND status IN ('open', 'matched')
-    ) THEN
-        RAISE EXCEPTION
-            'Lost report is not open or matched';
-    END IF;
+DROP TRIGGER IF EXISTS trg_validate_handover_date
+ON public.handover;
 
-    IF NOT EXISTS (
-        SELECT 1
-        FROM found_report
-        WHERE found_report_id = v_claim.found_report_id
-          AND status IN ('open', 'matched')
-    ) THEN
-        RAISE EXCEPTION
-            'Found report is not open or matched';
-    END IF;
+DROP TRIGGER IF EXISTS trg_validate_handover
+ON public.handover;
 
-    UPDATE claim
-    SET status = 'approved',
-        verified_by = p_staff_id,
-        verification_notes =
-            COALESCE(verification_notes, '')
-            || CASE
-                 WHEN COALESCE(verification_notes, '') = ''
-                 THEN ''
-                 ELSE E'\n'
-               END
-            || 'Approved by staff ID ' || p_staff_id
-    WHERE claim_id = p_claim_id;
+DROP TRIGGER IF EXISTS trg_close_reports_after_handover
+ON public.handover;
 
-    RETURN 'Claim approved; handover must be recorded separately';
-END;
-$$;
+DROP TRIGGER IF EXISTS trg_claim_updated_at
+ON public.claim;
 
 
--- ---------------------------------------------------------------------
--- 6. RECORD PHYSICAL HANDOVER
--- Inserts the handover and closes both reports in one transaction.
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 9. CLAIM TRIGGERS
+-- =====================================================================
 
-CREATE OR REPLACE FUNCTION record_handover(
-    p_claim_id INT,
-    p_staff_id INT,
-    p_verification_method VARCHAR(30),
-    p_remarks TEXT DEFAULT NULL
-)
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_claim_status VARCHAR(10);
-BEGIN
-    SELECT status
-    INTO v_claim_status
-    FROM claim
-    WHERE claim_id = p_claim_id
-    FOR UPDATE;
+DROP TRIGGER IF EXISTS trg_claim_write_guard
+ON public.claim;
 
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Claim % does not exist', p_claim_id;
-    END IF;
-
-    IF v_claim_status <> 'approved' THEN
-        RAISE EXCEPTION
-            'Only approved claims can have a handover recorded';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM staff
-        WHERE staff_id = p_staff_id
-          AND active = TRUE
-          AND role IN ('staff', 'admin')
-    ) THEN
-        RAISE EXCEPTION
-            'Invalid or inactive staff account: %', p_staff_id;
-    END IF;
-
-    INSERT INTO handover (
-        claim_id,
-        staff_id,
-        verification_method,
-        remarks
-    )
-    VALUES (
-        p_claim_id,
-        p_staff_id,
-        p_verification_method,
-        p_remarks
-    );
-
-    RETURN 'Handover recorded; both reports closed';
-END;
-$$;
-
-
--- ---------------------------------------------------------------------
--- 7. CREATE TRIGGERS
--- Drop only these named triggers so the script is re-runnable.
--- ---------------------------------------------------------------------
-
-DROP TRIGGER IF EXISTS trg_claim_status_audit ON claim;
-CREATE TRIGGER trg_claim_status_audit
-AFTER UPDATE OF status ON claim
+CREATE TRIGGER trg_claim_write_guard
+BEFORE INSERT OR UPDATE ON public.claim
 FOR EACH ROW
-EXECUTE FUNCTION audit_status_change();
+EXECUTE FUNCTION guard_claim_write();
 
-DROP TRIGGER IF EXISTS trg_lost_report_status_audit ON lost_report;
-CREATE TRIGGER trg_lost_report_status_audit
-AFTER UPDATE OF status ON lost_report
-FOR EACH ROW
-EXECUTE FUNCTION audit_status_change();
 
-DROP TRIGGER IF EXISTS trg_found_report_status_audit ON found_report;
-CREATE TRIGGER trg_found_report_status_audit
-AFTER UPDATE OF status ON found_report
-FOR EACH ROW
-EXECUTE FUNCTION audit_status_change();
-
-DROP TRIGGER IF EXISTS trg_claim_approval_reports ON claim;
 CREATE TRIGGER trg_claim_approval_reports
-AFTER UPDATE OF status ON claim
+AFTER UPDATE OF status ON public.claim
 FOR EACH ROW
 EXECUTE FUNCTION update_reports_after_claim_approval();
 
-DROP TRIGGER IF EXISTS trg_validate_handover_date ON handover;
-CREATE TRIGGER trg_validate_handover_date
-BEFORE INSERT ON handover
-FOR EACH ROW
-EXECUTE FUNCTION validate_handover_date();
 
-DROP TRIGGER IF EXISTS trg_close_reports_after_handover ON handover;
+CREATE TRIGGER trg_claim_status_audit
+AFTER UPDATE OF status ON public.claim
+FOR EACH ROW
+EXECUTE FUNCTION audit_status_change();
+
+
+-- =====================================================================
+-- 10. LOST REPORT TRIGGERS
+-- =====================================================================
+
+DROP TRIGGER IF EXISTS trg_lost_report_status_guard
+ON public.lost_report;
+
+CREATE TRIGGER trg_lost_report_status_guard
+BEFORE UPDATE OF status ON public.lost_report
+FOR EACH ROW
+EXECUTE FUNCTION guard_report_status();
+
+
+CREATE TRIGGER trg_lost_report_status_audit
+AFTER UPDATE OF status ON public.lost_report
+FOR EACH ROW
+EXECUTE FUNCTION audit_status_change();
+
+
+-- =====================================================================
+-- 11. FOUND REPORT TRIGGERS
+-- =====================================================================
+
+DROP TRIGGER IF EXISTS trg_found_report_status_guard
+ON public.found_report;
+
+CREATE TRIGGER trg_found_report_status_guard
+BEFORE UPDATE OF status ON public.found_report
+FOR EACH ROW
+EXECUTE FUNCTION guard_report_status();
+
+
+CREATE TRIGGER trg_found_report_status_audit
+AFTER UPDATE OF status ON public.found_report
+FOR EACH ROW
+EXECUTE FUNCTION audit_status_change();
+
+
+-- =====================================================================
+-- 12. HANDOVER TRIGGERS
+-- =====================================================================
+
+DROP TRIGGER IF EXISTS trg_handover_insert_guard
+ON public.handover;
+
+CREATE TRIGGER trg_handover_insert_guard
+BEFORE INSERT ON public.handover
+FOR EACH ROW
+EXECUTE FUNCTION guard_handover_insert();
+
+
+DROP TRIGGER IF EXISTS trg_handover_immutable
+ON public.handover;
+
+CREATE TRIGGER trg_handover_immutable
+BEFORE UPDATE OR DELETE ON public.handover
+FOR EACH ROW
+EXECUTE FUNCTION reject_handover_mutation();
+
+
 CREATE TRIGGER trg_close_reports_after_handover
-AFTER INSERT ON handover
+AFTER INSERT ON public.handover
 FOR EACH ROW
 EXECUTE FUNCTION close_reports_after_handover();
 
 
--- ---------------------------------------------------------------------
--- 8. UPDATED_AT TRIGGER FOR CLAIM
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 13. FUNCTION OWNERSHIP
+-- =====================================================================
 
-CREATE OR REPLACE FUNCTION set_claim_updated_at()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    NEW.updated_at = CURRENT_TIMESTAMP;
-    RETURN NEW;
-END;
-$$;
+ALTER FUNCTION audit_status_change()
+OWNER TO claims_workflow_owner;
 
-DROP TRIGGER IF EXISTS trg_claim_updated_at ON claim;
-CREATE TRIGGER trg_claim_updated_at
-BEFORE UPDATE ON claim
-FOR EACH ROW
-EXECUTE FUNCTION set_claim_updated_at();
+ALTER FUNCTION guard_claim_write()
+OWNER TO claims_workflow_owner;
+
+ALTER FUNCTION update_reports_after_claim_approval()
+OWNER TO claims_workflow_owner;
+
+ALTER FUNCTION guard_report_status()
+OWNER TO claims_workflow_owner;
+
+ALTER FUNCTION guard_handover_insert()
+OWNER TO claims_workflow_owner;
+
+ALTER FUNCTION reject_handover_mutation()
+OWNER TO claims_workflow_owner;
+
+ALTER FUNCTION close_reports_after_handover()
+OWNER TO claims_workflow_owner;
 
 
--- ---------------------------------------------------------------------
--- END
--- ---------------------------------------------------------------------
+-- =====================================================================
+-- 14. FUNCTION EXECUTION PRIVILEGES
+-- =====================================================================
+
+REVOKE ALL ON FUNCTION
+    audit_status_change(),
+    guard_claim_write(),
+    update_reports_after_claim_approval(),
+    guard_report_status(),
+    guard_handover_insert(),
+    reject_handover_mutation(),
+    close_reports_after_handover()
+FROM PUBLIC, claims_app;
+
+
+-- =====================================================================
+-- END OF CLAIMS WORKFLOW TRIGGER SCRIPT
+-- =====================================================================

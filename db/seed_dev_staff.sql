@@ -1,7 +1,9 @@
--- Permanent local development staff account.
--- Change the password before using this outside local development.
+-- ============================================================
+-- DEVELOPMENT STAFF ACCOUNT
+-- LOCAL / DISPOSABLE DATABASE ONLY
+-- ============================================================
 
-INSERT INTO staff (
+INSERT INTO public.staff (
     name,
     email,
     phone,
@@ -14,7 +16,20 @@ VALUES (
     'admin@lostfound.local',
     '9000000000',
     'admin',
-    crypt('LostFoundDev@2026', gen_salt('bf')),
+    public.crypt(
+        'LostFoundDev@2026',
+        public.gen_salt('bf')
+    ),
     TRUE
 )
 ON CONFLICT (email) DO NOTHING;
+
+-- Verify the development account
+SELECT
+    staff_id,
+    name,
+    email,
+    role,
+    active
+FROM public.staff
+WHERE email = 'admin@lostfound.local';
