@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import { useEffect, useState, type FormEvent } from "react";
 import { signOut } from "next-auth/react";
@@ -21,6 +21,8 @@ type ItemReport = {
 
 type Match = {
   match_id: number;
+  lost_report_id: number;
+  found_report_id: number;
   lost_item_name: string;
   found_item_name: string;
   lost_color: string | null;
@@ -518,7 +520,7 @@ export default function Home() {
 
       <footer className="border-t border-slate-200 bg-white">
         <div className="mx-auto max-w-6xl px-6 py-5 text-sm text-slate-500">
-          Lost & Found · Residential Community
+          Lost & Found Â· Residential Community
         </div>
       </footer>
     </main>
@@ -587,7 +589,7 @@ function ItemGrid({
               {(item.color || item.brand) && (
                 <div className="flex gap-2">
                   <dt className="font-medium text-slate-500">Details:</dt>
-                  <dd>{[item.color, item.brand].filter(Boolean).join(" · ")}</dd>
+                  <dd>{[item.color, item.brand].filter(Boolean).join(" Â· ")}</dd>
                 </div>
               )}
 
@@ -601,7 +603,7 @@ function ItemGrid({
                   {type === "lost" ? "Lost on:" : "Found on:"}
                 </dt>
                 <dd>
-                  {date ? new Date(date).toLocaleDateString("en-IN") : "—"}
+                  {date ? new Date(date).toLocaleDateString("en-IN") : "â€”"}
                 </dd>
               </div>
             </dl>
@@ -613,6 +615,46 @@ function ItemGrid({
 }
 
 function MatchGrid({ matches }: { matches: Match[] }) {
+  const [claimingId, setClaimingId] = useState<number | null>(null);
+  const [messages, setMessages] = useState<Record<number, string>>({});
+  const [claimedIds, setClaimedIds] = useState<number[]>([]);
+
+  async function submitClaim(match: Match) {
+    setClaimingId(match.match_id);
+    setMessages((current) => ({ ...current, [match.match_id]: "" }));
+
+    try {
+      const response = await fetch("/api/claims", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          lost_report_id: match.lost_report_id,
+          found_report_id: match.found_report_id,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.message || "Unable to submit claim.");
+      }
+
+      setClaimedIds((current) => [...current, match.match_id]);
+      setMessages((current) => ({
+        ...current,
+        [match.match_id]: "Claim submitted. Awaiting staff verification.",
+      }));
+    } catch (error) {
+      setMessages((current) => ({
+        ...current,
+        [match.match_id]:
+          error instanceof Error ? error.message : "Unable to submit claim.",
+      }));
+    } finally {
+      setClaimingId(null);
+    }
+  }
+
   if (matches.length === 0) {
     return (
       <p className="rounded-xl bg-white p-6 text-slate-600 shadow-sm">
@@ -646,7 +688,6 @@ function MatchGrid({ matches }: { matches: Match[] }) {
               description={match.lost_description}
               location={match.lost_location}
             />
-
             <MatchItem
               label="Found Item"
               name={match.found_item_name}
@@ -658,15 +699,32 @@ function MatchGrid({ matches }: { matches: Match[] }) {
           </div>
 
           <p className="mt-4 text-xs text-slate-500">
-            Semantic similarity:{" "}
-            {(Number(match.similarity_score) * 100).toFixed(2)}%
+            Semantic similarity: {(Number(match.similarity_score) * 100).toFixed(2)}%
           </p>
+
+          <button
+            type="button"
+            onClick={() => submitClaim(match)}
+            disabled={claimingId !== null || claimedIds.includes(match.match_id)}
+            className="mt-4 rounded-lg bg-teal-700 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {claimingId === match.match_id
+              ? "Submitting..."
+              : claimedIds.includes(match.match_id)
+                ? "Claim Submitted"
+                : "Claim This Item"}
+          </button>
+
+          {messages[match.match_id] && (
+            <p className="mt-2 text-sm text-slate-600" role="status">
+              {messages[match.match_id]}
+            </p>
+          )}
         </article>
       ))}
     </div>
   );
 }
-
 function MatchItem({
   label,
   name,
@@ -692,7 +750,7 @@ function MatchItem({
         {description || "No description provided."}
       </p>
       <p className="mt-3 text-xs text-slate-500">
-        {[color, brand].filter(Boolean).join(" · ") || "No additional details"}
+        {[color, brand].filter(Boolean).join(" Â· ") || "No additional details"}
       </p>
       <p className="mt-1 text-xs text-slate-500">Location: {location}</p>
     </div>
