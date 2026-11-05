@@ -38,6 +38,23 @@ type Match = {
   similarity_score: string;
   match_score: string;
 };
+type ReportingSummary = {
+  total_lost_reports: string;
+  total_found_reports: string;
+  open_lost_reports: string;
+  open_found_reports: string;
+  total_matches: string;
+};
+
+type CategoryReport = {
+  category_name: string;
+  report_count: string;
+};
+
+type ReportingData = {
+  summary: ReportingSummary;
+  reportsByCategory: CategoryReport[];
+};
 
 type Tab = "found" | "lost" | "matches";
 type ReportType = "lost" | "found";
@@ -95,6 +112,7 @@ export default function Home() {
   const [foundItems, setFoundItems] = useState<ItemReport[]>([]);
   const [lostItems, setLostItems] = useState<ItemReport[]>([]);
   const [matches, setMatches] = useState<Match[]>([]);
+  const [reporting, setReporting] = useState<ReportingData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -105,17 +123,29 @@ export default function Home() {
   const [formError, setFormError] = useState("");
 
   async function loadDashboard() {
-    const [foundResponse, lostResponse, matchResponse] = await Promise.all([
-      fetch("/api/found-items"),
-      fetch("/api/lost-items"),
-      fetch("/api/matches"),
-    ]);
+    const [
+  foundResponse,
+  lostResponse,
+  matchResponse,
+  reportingResponse,
+] = await Promise.all([
+  fetch("/api/found-items"),
+  fetch("/api/lost-items"),
+  fetch("/api/matches"),
+  fetch("/api/reporting"),
+]);
 
-    const [foundResult, lostResult, matchResult] = await Promise.all([
-      foundResponse.json(),
-      lostResponse.json(),
-      matchResponse.json(),
-    ]);
+    const [
+  foundResult,
+  lostResult,
+  matchResult,
+  reportingResult,
+] = await Promise.all([
+  foundResponse.json(),
+  lostResponse.json(),
+  matchResponse.json(),
+  reportingResponse.json(),
+]);
 
     if (
       !foundResponse.ok ||
@@ -123,7 +153,9 @@ export default function Home() {
       !matchResponse.ok ||
       !foundResult.success ||
       !lostResult.success ||
-      !matchResult.success
+      !matchResult.success ||
+!reportingResponse.ok ||
+!reportingResult.success
     ) {
       throw new Error("Unable to load dashboard data");
     }
@@ -131,6 +163,7 @@ export default function Home() {
     setFoundItems(foundResult.data);
     setLostItems(lostResult.data);
     setMatches(matchResult.matches);
+    setReporting(reportingResult);
   }
 
   useEffect(() => {
@@ -250,6 +283,65 @@ export default function Home() {
           <SummaryCard label="Open Found Reports" value={foundItems.length} />
           <SummaryCard label="Potential Matches" value={matches.length} />
         </div>
+
+        {/* Reporting analytics */}
+        {reporting && (
+          <section className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-xl font-semibold">Reporting Analytics</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Overview of reports recorded in the database.
+            </p>
+
+            <div className="mt-5 grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+              <SummaryCard
+                label="Total Lost Reports"
+                value={Number(reporting.summary.total_lost_reports)}
+              />
+              <SummaryCard
+                label="Total Found Reports"
+                value={Number(reporting.summary.total_found_reports)}
+              />
+              <SummaryCard
+                label="Open Lost Reports"
+                value={Number(reporting.summary.open_lost_reports)}
+              />
+              <SummaryCard
+                label="Open Found Reports"
+                value={Number(reporting.summary.open_found_reports)}
+              />
+              <SummaryCard
+                label="Total Matches"
+                value={Number(reporting.summary.total_matches)}
+              />
+            </div>
+
+            <div className="mt-6">
+              <h3 className="text-lg font-semibold">Reports by Category</h3>
+
+              {reporting.reportsByCategory.length === 0 ? (
+                <p className="mt-2 text-sm text-slate-500">
+                  No reports available.
+                </p>
+              ) : (
+                <div className="mt-3 space-y-3">
+                  {reporting.reportsByCategory.map((category) => (
+                    <div
+                      key={category.category_name}
+                      className="flex items-center justify-between gap-4 rounded-lg bg-slate-50 px-4 py-3"
+                    >
+                      <span className="text-sm font-medium">
+                        {category.category_name}
+                      </span>
+                      <span className="text-sm font-semibold text-teal-700">
+                        {category.report_count}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
 
         {/* Report submission section */}
         <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
