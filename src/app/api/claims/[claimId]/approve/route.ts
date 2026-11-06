@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { executeClaimsAction } from "@/lib/claims-workflow";
@@ -28,6 +27,7 @@ export async function POST(
 
   const { claimId } = await context.params;
   const id = Number(claimId);
+  const staffId = Number(session.user.staffId);
 
   if (!Number.isSafeInteger(id) || id <= 0) {
     return NextResponse.json(
@@ -36,9 +36,16 @@ export async function POST(
     );
   }
 
+  if (!Number.isSafeInteger(staffId) || staffId <= 0) {
+    return NextResponse.json(
+      { success: false, message: "Invalid staff identity" },
+      { status: 401 }
+    );
+  }
+
   try {
     const result = await executeClaimsAction<{ result: string }>(
-      Number(session.user.staffId),
+      staffId,
       "claim:approve",
       `SELECT public.approve_claim($1, $2) AS result`,
       [id]
@@ -50,10 +57,11 @@ export async function POST(
     });
   } catch (error) {
     console.error("Claim approval failed:", error);
-
-    return NextResponse.json(
-      { success: false, message: "Claim approval failed" },
-      { status: 400 }
-    );
+    const pgError = error as { code?: string; message?: string };
+    const message =
+      pgError.code === "P0001" && pgError.message
+        ? pgError.message
+        : "Claim approval failed";
+    return NextResponse.json({ success: false, message }, { status: 400 });
   }
 }

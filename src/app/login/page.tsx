@@ -2,36 +2,71 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { signIn } from "next-auth/react";
+import { signIn, signOut, getSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 
 export default function LoginPage() {
   const router = useRouter();
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [staffMode, setStaffMode] = useState(false);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
     setLoading(true);
 
-    const result = await signIn("credentials", {
-      email,
-      password,
-      redirect: false,
-    });
+    try {
+      const result = await signIn("credentials", {
+        email,
+        password,
+        redirect: false,
+      });
 
-    setLoading(false);
+      if (!result || result.error) {
+        setError("Invalid email or password.");
+        return;
+      }
 
-    if (result?.error) {
-      setError("Invalid email or password.");
-      return;
+      const session = await getSession();
+      const role = String(session?.user?.role ?? "");
+
+      if (staffMode) {
+        if (role === "staff" || role === "admin") {
+          router.push("/staff");
+        } else {
+          await signOut({ redirect: false });
+          setError("This account is not authorized for staff login.");
+          return;
+        }
+      } else {
+        if (role === "resident") {
+          router.push("/");
+        } else if (role === "staff" || role === "admin") {
+          router.push("/staff");
+        } else {
+          setError("Unable to determine account role. Please sign in again.");
+          return;
+        }
+      }
+
+      router.refresh();
+    } catch {
+      setError("Unable to sign in. Please try again.");
+    } finally {
+      setLoading(false);
     }
+  }
 
-    router.push("/");
-    router.refresh();
+  function switchMode(isStaff: boolean) {
+    setStaffMode(isStaff);
+    setError("");
+    setEmail("");
+    setPassword("");
   }
 
   return (
@@ -45,12 +80,17 @@ export default function LoginPage() {
             Lost & Found
           </h1>
           <p className="mt-1 text-sm text-gray-600">
-            Sign in to your residential community account
+            {staffMode
+              ? "Staff portal sign in"
+              : "Sign in to your residential community account"}
           </p>
         </div>
 
         <div>
-          <label htmlFor="email" className="mb-1 block text-sm font-medium">
+          <label
+            htmlFor="email"
+            className="mb-1 block text-sm font-medium text-gray-900"
+          >
             Email
           </label>
           <input
@@ -60,12 +100,15 @@ export default function LoginPage() {
             autoComplete="email"
             value={email}
             onChange={(event) => setEmail(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2"
+            className="w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900"
           />
         </div>
 
         <div>
-          <label htmlFor="password" className="mb-1 block text-sm font-medium">
+          <label
+            htmlFor="password"
+            className="mb-1 block text-sm font-medium text-gray-900"
+          >
             Password
           </label>
           <input
@@ -75,7 +118,7 @@ export default function LoginPage() {
             autoComplete="current-password"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
-            className="w-full rounded-md border border-gray-300 px-3 py-2"
+            className="w-full rounded-md border border-gray-300 px-3 py-2 text-gray-900"
           />
         </div>
 
@@ -90,8 +133,50 @@ export default function LoginPage() {
           disabled={loading}
           className="w-full rounded-md bg-blue-600 px-4 py-2 font-medium text-white hover:bg-blue-700 disabled:opacity-60"
         >
-          {loading ? "Signing in..." : "Sign in"}
+          {loading
+            ? "Signing in..."
+            : staffMode
+              ? "Sign in to staff portal"
+              : "Sign in"}
         </button>
+
+        {!staffMode && (
+          <p className="text-center text-sm text-gray-600">
+            Don&apos;t have a resident account?{" "}
+            <Link
+              href="/signup"
+              className="font-medium text-blue-600 hover:underline"
+            >
+              Create resident account
+            </Link>
+          </p>
+        )}
+
+        <div className="border-t border-gray-200 pt-4 text-center">
+          {staffMode ? (
+            <p className="text-sm text-gray-600">
+              Not staff?{" "}
+              <button
+                type="button"
+                onClick={() => switchMode(false)}
+                className="font-medium text-blue-600 hover:underline"
+              >
+                Resident sign in
+              </button>
+            </p>
+          ) : (
+            <p className="text-sm text-gray-600">
+              Are you a staff member?{" "}
+              <button
+                type="button"
+                onClick={() => switchMode(true)}
+                className="font-medium text-blue-600 hover:underline"
+              >
+                Sign in to the staff portal
+              </button>
+            </p>
+          )}
+        </div>
       </form>
     </main>
   );

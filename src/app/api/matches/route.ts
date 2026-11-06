@@ -1,17 +1,29 @@
+
 import { NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 import { auth } from "@/auth";
+
 export async function GET() {
   const session = await auth();
+  console.log("MATCHES SESSION:", session?.user);
+  const user = session?.user as
+    | { role?: string; residentId?: number }
+    | undefined;
 
-  if (!session?.user) {
+  if (
+    !user ||
+    user.role !== "resident" ||
+    !user.residentId
+  ) {
     return NextResponse.json(
-      { success: false, message: "Unauthorized" },
+      { success: false, message: "Only authenticated residents can view their matches." },
       { status: 401 }
     );
   }
+
   try {
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT
         m.match_id,
         m.lost_report_id,
@@ -36,25 +48,28 @@ export async function GET() {
         ll.location_name AS lost_location,
         fl.location_name AS found_location
 
-      FROM match m
-      JOIN lost_report l
+      FROM public.match m
+      JOIN public.lost_report l
         ON l.lost_report_id = m.lost_report_id
-      JOIN item li
+      JOIN public.item li
         ON li.item_id = l.item_id
-      JOIN found_report f
+      JOIN public.found_report f
         ON f.found_report_id = m.found_report_id
-      JOIN item fi
+      JOIN public.item fi
         ON fi.item_id = f.item_id
-      JOIN location ll
+      JOIN public.location ll
         ON ll.location_id = l.location_id
-      JOIN location fl
+      JOIN public.location fl
         ON fl.location_id = f.location_id
 
-      WHERE l.status IN ('open', 'matched')
+      WHERE l.resident_id = $1
+        AND l.status IN ('open', 'matched')
         AND f.status IN ('open', 'matched')
 
       ORDER BY m.match_score DESC, m.generated_at DESC;
-    `);
+      `,
+      [user.residentId]
+    );
 
     return NextResponse.json({
       success: true,
@@ -62,10 +77,10 @@ export async function GET() {
       matches: result.rows,
     });
   } catch (error) {
-    console.error("Fetching matches failed:", error);
+    console.error("Fetching resident matches failed:", error);
 
     return NextResponse.json(
-      { success: false, error: "Failed to fetch matches." },
+      { success: false, message: "Failed to fetch matches." },
       { status: 500 }
     );
   }

@@ -66,7 +66,7 @@ BEGIN
     END IF;
 
     IF to_regprocedure(
-        'public.record_handover(integer,character varying,text,text,timestamp without time zone)'
+        'public.record_handover(integer,character varying,text,timestamp without time zone,text)'
     ) IS NULL THEN
         RAISE EXCEPTION
             'record_handover function is missing';
@@ -374,7 +374,7 @@ BEGIN
 
     IF NOT has_function_privilege(
         'claims_app',
-        'public.record_handover(integer,character varying,text,text,timestamp without time zone)',
+        'public.record_handover(integer,character varying,text,timestamp without time zone,text)',
         'EXECUTE'
     ) THEN
         RAISE EXCEPTION
@@ -403,8 +403,7 @@ BEGIN
     WHERE n.nspname = 'claims_private'
       AND p.proname = 'reserve_assertion'
       AND p.prokind = 'p'
-      AND pg_get_function_identity_arguments(p.oid)
-          = 'text, integer, xid8';
+      AND oidvectortypes(p.proargtypes) = 'text, integer, xid8';
 
     IF v_procedure_oid IS NULL THEN
         RAISE EXCEPTION
