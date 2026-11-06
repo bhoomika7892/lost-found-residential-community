@@ -73,9 +73,9 @@ export async function POST(
       `SELECT public.record_handover(
         $1,
         $2,
-        $5,
         $3,
-        $4::timestamp
+        $4::timestamp,
+        $5
       ) AS result`,
       [id, method, remarks, new Date()]
     );

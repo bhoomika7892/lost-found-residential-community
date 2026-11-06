@@ -1,25 +1,26 @@
 import "next-auth";
 import "next-auth/jwt";
-import type { DefaultSession } from "next-auth";
-declare module "next-auth" {
-  interface User {
-    role?: "resident" | "staff";
-    residentId?: number;
-    staffId?: number;
-  }
 
+declare module "next-auth" {
   interface Session {
     user: {
-      role?: "resident" | "staff";
+      id?: string;
+      role?: "resident" | "staff" | "admin";
       residentId?: number;
       staffId?: number;
     } & DefaultSession["user"];
+  }
+
+  interface User {
+    role?: "resident" | "staff" | "admin";
+    residentId?: number;
+    staffId?: number;
   }
 }
 
 declare module "next-auth/jwt" {
   interface JWT {
-    role?: "resident" | "staff";
+    role?: "resident" | "staff" | "admin";
     residentId?: number;
     staffId?: number;
   }

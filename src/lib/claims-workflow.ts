@@ -91,7 +91,7 @@ export async function executeClaimsAction<T>(
 
     reservationClient.release();
     reservationClient = undefined;
-
+    console.log("assertion parts:", assertion.split(".").length, "params:", [...parameters, "<assertion>"]);
     const result = await businessClient.query(sql, [
       ...parameters,
       assertion,
